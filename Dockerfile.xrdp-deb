@@ -49,11 +49,10 @@ RUN set -eux; \
     rm -rf /tmp/debs /var/lib/apt/lists/*; \
     mkdir -p /out
 
-# Package-assembly helper, maintainer scripts and the pipewire conf fragment.
+# Package-assembly helper and maintainer scripts.
 # Plain COPY (no --chmod: this host's classic builder rejects it) + explicit
 # chmod, mirroring the original `RUN chmod +x` steps.
 COPY scripts/make-control.sh scripts/xrdp.postinst scripts/xorgxrdp.postinst /usr/local/share/xrdp-deb/
-COPY scripts/xrdp-pipewire.conf /usr/local/share/xrdp-deb/xrdp-pipewire.conf
 RUN set -eux; \
     chmod 0755 /usr/local/share/xrdp-deb/make-control.sh \
                /usr/local/share/xrdp-deb/xrdp.postinst \
@@ -163,8 +162,11 @@ RUN set -eux; \
     make DESTDIR=/build/pw-deb install; \
     mv /build/pw-deb/usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-xrdp-pipewire.so \
        /build/pw-deb/usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-xrdp.so; \
-    mkdir -p /build/pw-deb/usr/share/pipewire/pipewire.conf.d/; \
-    install -m 0644 /usr/local/share/xrdp-deb/xrdp-pipewire.conf /build/pw-deb/usr/share/pipewire/pipewire.conf.d/xrdp.conf; \
+    # The v0.1 tag's autostart script still loads the module under its
+    # pre-rename name; re-point it at the renamed file so on-demand loading
+    # actually finds the .so (upstream master made the same change).
+    grep -qF 'load-module libpipewire-module-xrdp-pipewire' /build/pw-deb/usr/libexec/pipewire-module-xrdp/load_pw_modules.sh; \
+    sed -i 's/libpipewire-module-xrdp-pipewire/libpipewire-module-xrdp/g' /build/pw-deb/usr/libexec/pipewire-module-xrdp/load_pw_modules.sh; \
     dpkg-deb --build /build/pw-deb "/out/xlibre-pipewire-module-xrdp_${PW_VERSION}-${PKG_REV}_amd64.deb"; \
     rm -rf /build/pipewire-module-xrdp /build/pw-deb
 
