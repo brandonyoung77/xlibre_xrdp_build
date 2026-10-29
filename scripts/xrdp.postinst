@@ -1,0 +1,51 @@
+#!/bin/bash
+set -e
+[ -z "$DPKG_MAINTSCRIPT_PACKAGE" ] && exit 0
+
+if ! getent group xrdp > /dev/null; then addgroup --system xrdp; fi
+if ! getent passwd xrdp > /dev/null; then adduser --system --ingroup xrdp --home /run/xrdp --no-create-home --shell /usr/sbin/nologin xrdp; fi
+
+# This tells xrdp to drop its privileges automatically right after binding to port 3389
+sed -i 's|^#[[:space:]]*runtime_user=.*|runtime_user=xrdp|' /etc/xrdp/xrdp.ini
+sed -i 's|^#[[:space:]]*runtime_group=.*|runtime_group=xrdp|' /etc/xrdp/xrdp.ini
+sed -i 's|^#[[:space:]]*SessionSockdirGroup=.*|SessionSockdirGroup=xrdp|' /etc/xrdp/sesman.ini
+
+# Replace the execution of Xsession with dbus-run-session. The line is
+# indented inside wm_start() in xrdp 0.10.6 startwm.sh, so the pattern must
+# tolerate leading whitespace; only patch when dbus-run-session exists.
+if command -v dbus-run-session > /dev/null 2>&1; then
+    sed -i 's|^\([[:space:]]*\)\. /etc/X11/Xsession|\1dbus-run-session /etc/X11/Xsession|' /etc/xrdp/startwm.sh
+fi
+
+# Configure certificate paths
+sed -i 's|^certificate=.*|certificate=/etc/xrdp/cert.pem|' /etc/xrdp/xrdp.ini
+sed -i 's|^key_file=.*|key_file=/etc/xrdp/key.pem|' /etc/xrdp/xrdp.ini
+
+# Handle snakeoil certificates
+if [ ! -f /etc/xrdp/cert.pem ] || [ ! -f /etc/xrdp/key.pem ]; then
+    make-ssl-cert generate-default-snakeoil --force-overwrite > /dev/null 2>&1 || true
+    ln -sf /etc/ssl/certs/ssl-cert-snakeoil.pem /etc/xrdp/cert.pem
+    ln -sf /etc/ssl/private/ssl-cert-snakeoil.key /etc/xrdp/key.pem
+fi
+
+# Ensure xrdp group has read access to the keys before dropping root privileges
+chown root:xrdp /etc/ssl/private/ssl-cert-snakeoil.key /etc/xrdp/key.pem
+chmod 640 /etc/ssl/private/ssl-cert-snakeoil.key /etc/xrdp/key.pem
+usermod -a -G ssl-cert xrdp > /dev/null 2>&1 || true
+
+# Set directory states (recursive chown first, so the rsakeys.ini
+# override below is not clobbered)
+mkdir -p /run/xrdp /run/xrdp/sockdir /var/log/xrdp
+chown -R xrdp:xrdp /run/xrdp /var/log/xrdp /etc/xrdp
+
+# rsakeys.ini holds private keys: must end up root-owned, group xrdp, 0640
+if [ -f /etc/xrdp/rsakeys.ini ]; then
+    chown root:xrdp /etc/xrdp/rsakeys.ini
+    chmod 640 /etc/xrdp/rsakeys.ini
+fi
+
+if command -v systemctl > /dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable xrdp.service xrdp-sesman.service
+fi
+exit 0

@@ -1,0 +1,173 @@
+# Builds three xlibre-flavored debs in /out:
+#   xlibre-xrdp, xlibre-xorgxrdp, xlibre-pipewire-module-xrdp
+#
+# NOTE: this host's builder silently drops the bodies of heredoc-inside-RUN
+# constructs (and BuildKit-only `RUN <<EOF` is broken here too), so no
+# heredoc syntax is used anywhere in this file. All script bodies live in
+# scripts/ and are COPY'd into the builder image.
+
+FROM debian:trixie AS builder
+
+# Upstream versions / package data (defaults are the values this file has
+# always built with)
+ARG XRDP_VERSION=0.10.6.1
+ARG XORGXRDP_VERSION=0.10.5
+ARG PW_VERSION=0.1
+ARG XLIBRE_VER=25.1.10-1
+ARG PKG_REV=1
+
+# The CFLAGS= prefix on xorgxrdp's ./configure references $CFLAGS; define it
+# (empty, as in the default build environment) so `set -u` cannot kill STEP B.
+ENV CFLAGS=
+
+# Enable non-free components
+RUN set -eux; \
+    sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
+
+# 1. Install build dependencies (comprehensive flag and driver coverage)
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential git autoconf automake libtool pkg-config ca-certificates \
+        dpkg-dev fakeroot \
+        libssl-dev libpam0g-dev libx11-dev libxfixes-dev libxrandr-dev \
+        libpixman-1-dev nasm libdrm-dev libxfont-dev \
+        libpipewire-0.3-dev libspa-0.2-dev \
+        # --- headers required for all of the ./configure flags below ---
+        libmp3lame-dev libfdk-aac-dev libopus-dev \
+        libx264-dev libopenh264-dev libjpeg62-turbo-dev \
+        libfuse3-dev libfreetype-dev libimlib2-dev \
+        libibus-1.0-dev libsystemd-dev libepoxy-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. Install local xlibre debs (input filenames fixed)
+COPY debs/xlibre-server_${XLIBRE_VER}_amd64.deb /tmp/debs/
+COPY debs/xlibre-server-dev_${XLIBRE_VER}_amd64.deb /tmp/debs/
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y /tmp/debs/*.deb; \
+    rm -rf /tmp/debs /var/lib/apt/lists/*; \
+    mkdir -p /out
+
+# Package-assembly helper, maintainer scripts and the pipewire conf fragment.
+# Plain COPY (no --chmod: this host's classic builder rejects it) + explicit
+# chmod, mirroring the original `RUN chmod +x` steps.
+COPY scripts/make-control.sh scripts/xrdp.postinst scripts/xorgxrdp.postinst /usr/local/share/xrdp-deb/
+COPY scripts/xrdp-pipewire.conf /usr/local/share/xrdp-deb/xrdp-pipewire.conf
+RUN set -eux; \
+    chmod 0755 /usr/local/share/xrdp-deb/make-control.sh \
+               /usr/local/share/xrdp-deb/xrdp.postinst \
+               /usr/local/share/xrdp-deb/xorgxrdp.postinst
+
+WORKDIR /build
+
+# ==========================================================
+# STEP A: Build & install xrdp to /usr (satisfies xorgxrdp deps)
+# ==========================================================
+RUN set -eux; \
+    git clone --branch "v${XRDP_VERSION}" --depth 1 https://github.com/neutrinolabs/xrdp.git; \
+    cd xrdp; \
+    ./bootstrap; \
+    ./configure --prefix=/usr --with-systemdsystemunitdir=/usr/lib/systemd/system \
+        --enable-ibus --enable-ipv6 --enable-jpeg --enable-fuse --enable-mp3lame \
+        --enable-fdkaac --enable-opus --enable-rfxcodec --enable-painter \
+        --enable-pixman --enable-utmp --with-imlib2 --with-freetype2 \
+        --enable-x264 --enable-openh264 --enable-vsock; \
+    make -j"$(nproc)"; \
+    make install
+
+# ==========================================================
+# STEP B: Build & install xorgxrdp (patched to build against xlibre-server)
+# ==========================================================
+# Every pattern-critical sed below is preceded by `grep -qF` of the exact
+# literal it matches, so a pattern miss fails the build loudly instead of
+# silently skipping the patch. Three seds from the original patch set are
+# dead code for the pinned v0.10.5 tag (verified against the tag's sources
+# and the generated configure): configure.ac has `[[#include <dix.h>]])`
+# (not `[[#include ]])`), contains no `sysinputdir`, and the moduledir line
+# reads `moduledir=`pkg-config ...`` so the pattern `module`pkg-config ...`
+# (backtick right after "module") cannot match. They are kept byte-for-byte
+# for parity and deliberately un-asserted, since asserting them would always
+# fail. The /usr/lib/xorg/modules/xlibre-25 pinning is actually provided by
+# xlibre-server-dev's compat xorg-server.pc (moduledir/input_drivers_dir).
+RUN set -eux; \
+    git clone --branch "v${XORGXRDP_VERSION}" --depth 1 https://github.com/neutrinolabs/xorgxrdp.git; \
+    cd xorgxrdp; \
+    grep -qF 'xorg-server >=' configure.ac; \
+    sed -i 's|xorg-server >=|xlibre-server >=|g' configure.ac; \
+    grep -qF '[xorg-server]' configure.ac; \
+    sed -i 's|\[xorg-server\]|[xlibre-server]|g' configure.ac; \
+    grep -qF 'xserver-xorg-dev, xorg-x11-server-sdk or xorg-x11-server-devel' configure.ac; \
+    sed -i 's|xserver-xorg-dev, xorg-x11-server-sdk or xorg-x11-server-devel|xlibre-server-dev|g' configure.ac; \
+    sed -i 's|\[\[#include \]\])|[[\n#include <xorg-server.h>\n#include <xserver-properties.h>\n    ]])|' configure.ac; \
+    grep -qF 'keylayout 0x%8.8x variant %s display %s",' xrdpkeyb/rdpKeyboard.c; \
+    sed -i 's|keylayout 0x%8\.8x variant %s display %s",|keylayout 0x%8.8x variant %s",|' xrdpkeyb/rdpKeyboard.c; \
+    grep -qF 'keylayout, client_info->variant, display));' xrdpkeyb/rdpKeyboard.c; \
+    sed -i 's|keylayout, client_info->variant, display));|keylayout, client_info->variant));|' xrdpkeyb/rdpKeyboard.c; \
+    ./bootstrap; \
+    sed -i 's|module`pkg-config xorg-server --variable=moduledir`|moduledir="/usr/lib/xorg/modules/xlibre-25"|' configure; \
+    sed -i 's|sysinputdir="$moduledir/input"|sysinputdir="/usr/lib/xorg/modules/xlibre-25/input"|' configure; \
+    CFLAGS="$CFLAGS -ffat-lto-objects -DNullClient=NULL $(pkg-config --cflags-only-I libdrm)" ./configure --prefix=/usr --enable-glamor; \
+    make -j"$(nproc)"; \
+    make install
+
+# ==========================================================
+# STEP C: Package xrdp into a .deb
+# ==========================================================
+# Depends use the trixie (Debian 13) package names: libssl3t64, libfdk-aac2t64,
+# libimlib2t64 and libpipewire-0.3-0t64 are t64-transition renames, and the
+# ibus library package is libibus-1.0-5 (dot form). Codec deps (libx264-164,
+# libopenh264-8, libfdk-aac2t64) verified via NEEDED/ldd of the built binaries.
+RUN set -eux; \
+    cd /build/xrdp; \
+    /usr/local/share/xrdp-deb/make-control.sh /build/xrdp-deb "xlibre-xrdp" "${XRDP_VERSION}-${PKG_REV}" "xrdp" \
+        "libssl3t64 (>= 3.0.0), libpam0g (>= 1.5.2), libx11-6 (>= 2:1.8.4), libxfixes3, libxrandr2, ssl-cert, libmp3lame0, libfdk-aac2t64, libopus0, libx264-164, libopenh264-8, libjpeg62-turbo, libfuse3-4, libfreetype6, libimlib2t64, libibus-1.0-5, libpixman-1-0, libsystemd0" \
+        "Open source RDP server with drive, audio, and microphone redirection"; \
+    install -m 0755 /usr/local/share/xrdp-deb/xrdp.postinst /build/xrdp-deb/DEBIAN/postinst; \
+    make DESTDIR=/build/xrdp-deb install; \
+    dpkg-deb --build /build/xrdp-deb "/out/xlibre-xrdp_${XRDP_VERSION}-${PKG_REV}_amd64.deb"; \
+    rm -rf /build/xrdp /build/xrdp-deb
+
+# ==========================================================
+# STEP D: Package xorgxrdp into a .deb
+# ==========================================================
+# xlibre-orgxrdp: earlier builds shipped this package under that typo name.
+# Conflicts + Replaces migrates those installs (apt removes the old package
+# before unpacking the new one, so /etc/X11/xrdp/xorg.conf transfers cleanly).
+RUN set -eux; \
+    cd /build/xorgxrdp; \
+    /usr/local/share/xrdp-deb/make-control.sh /build/xorg-deb "xlibre-xorgxrdp" "${XORGXRDP_VERSION}-${PKG_REV}" "xorgxrdp, xlibre-orgxrdp" \
+        "xlibre-xrdp, xlibre-server, libpixman-1-0, libdrm2, libepoxy0" \
+        "XLibre drivers for xrdp"; \
+    # /etc/X11/xrdp/xorg.conf is the xrdp-session Xorg config (upstream make
+    # install ships it; Debian's xorgxrdp marks it a conffile) — preserve the
+    # same conffile semantics so user edits survive upgrades
+    echo '/etc/X11/xrdp/xorg.conf' > /build/xorg-deb/DEBIAN/conffiles; \
+    install -m 0755 /usr/local/share/xrdp-deb/xorgxrdp.postinst /build/xorg-deb/DEBIAN/postinst; \
+    make DESTDIR=/build/xorg-deb install; \
+    dpkg-deb --build /build/xorg-deb "/out/xlibre-xorgxrdp_${XORGXRDP_VERSION}-${PKG_REV}_amd64.deb"; \
+    rm -rf /build/xorgxrdp /build/xorg-deb
+
+# ==========================================================
+# STEP E: Package pipewire module
+# ==========================================================
+RUN set -eux; \
+    git clone --branch "v${PW_VERSION}" --depth 1 https://github.com/neutrinolabs/pipewire-module-xrdp.git; \
+    cd /build/pipewire-module-xrdp; \
+    ./bootstrap; \
+    ./configure --prefix=/usr; \
+    make -j"$(nproc)"; \
+    /usr/local/share/xrdp-deb/make-control.sh /build/pw-deb "xlibre-pipewire-module-xrdp" "${PW_VERSION}-${PKG_REV}" "pipewire-module-xrdp" \
+        "xlibre-xrdp, libpipewire-0.3-0t64, libspa-0.2-modules" \
+        "PipeWire module for xrdp audio and microphone redirection"; \
+    make DESTDIR=/build/pw-deb install; \
+    mv /build/pw-deb/usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-xrdp-pipewire.so \
+       /build/pw-deb/usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-xrdp.so; \
+    mkdir -p /build/pw-deb/usr/share/pipewire/pipewire.conf.d/; \
+    install -m 0644 /usr/local/share/xrdp-deb/xrdp-pipewire.conf /build/pw-deb/usr/share/pipewire/pipewire.conf.d/xrdp.conf; \
+    dpkg-deb --build /build/pw-deb "/out/xlibre-pipewire-module-xrdp_${PW_VERSION}-${PKG_REV}_amd64.deb"; \
+    rm -rf /build/pipewire-module-xrdp /build/pw-deb
+
+# Stage 2: Output
+FROM scratch
+COPY --from=builder /out/*.deb /

@@ -1,0 +1,17 @@
+#!/bin/bash
+set -e
+[ -z "$DPKG_MAINTSCRIPT_PACKAGE" ] && exit 0
+if [ -f /etc/xrdp/sesman.ini ]; then
+    sed -i 's|^param=Xorg.*$|param=/usr/lib/xorg/Xorg|' /etc/xrdp/sesman.ini
+fi
+
+# Ensure the runtime directories exist with correct owner permissions
+mkdir -p /run/xrdp /run/xrdp/sockdir /var/log/xrdp
+chown -R xrdp:xrdp /run/xrdp /var/log/xrdp
+chmod 755 /run/xrdp
+
+if command -v systemctl > /dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl try-restart xrdp.service xrdp-sesman.service || true
+fi
+exit 0
